@@ -26,6 +26,7 @@ module.exports = {
     },
     localhost: {
       url: "http://localhost:8545",
+      chainId: 31337,
     }
   },
   paths: {

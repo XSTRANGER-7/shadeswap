@@ -2,11 +2,14 @@
 pragma solidity ^0.8.18;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@oasisprotocol/sapphire-contracts/contracts/Sapphire.sol";
-// Added for ERC20 safety and reentrancy protection
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/Context.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@oasisprotocol/sapphire-contracts/contracts/Sapphire.sol";
 import "./interfaces/ISwapRouter.sol";
 
 /**
@@ -14,8 +17,9 @@ import "./interfaces/ISwapRouter.sol";
  * @dev Smart contract for managing private personas on Oasis Sapphire
  * Utilizes Sapphire's confidential computation features for privacy
  */
-contract IdentityShapeshifter is Ownable, ReentrancyGuard {
+contract IdentityShapeshifter is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
+    using Counters for Counters.Counter;
     // Use Sapphire's encryption utilities
     // using Sapphire for bytes;
     // using Sapphire for bytes32;
@@ -40,6 +44,9 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
     // Uniswap V3 router configuration
     address public swapRouter; // zero means "simulation mode" for local dev/tests
     uint24 public poolFee = 3000; // default 0.3%
+    
+    // Counter for identity IDs (using OpenZeppelin's Counters)
+    Counters.Counter private _identityCounter;
 
     // Mapping from user address => identity ID => Identity
     // All identity data is kept confidential on the Sapphire ParaTime
@@ -64,10 +71,14 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
     event RouterConfigured(address router, uint24 fee);
 
     /**
-     * @dev Optional initializer to set router and default pool fee later via owner functions.
+     * @dev Constructor initializes the contract with OpenZeppelin patterns
+     * Optional initializer to set router and default pool fee later via owner functions.
      * Keeping empty constructor preserves existing deploy scripts.
      */
-    constructor() {}
+    constructor() {
+        // Initialize the counter (starts at 0, first increment will be 1)
+        _identityCounter.reset();
+    }
 
     /**
      * @dev Owner can set or update the Uniswap V3 router and fee. Setting router to address(0)
@@ -80,6 +91,20 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
     }
 
     /**
+     * @dev Pause the contract - emergency stop functionality using OpenZeppelin's Pausable
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
      * @dev Create a new identity/persona. On Sapphire, state is encrypted at rest,
      * so we can store metadata directly. If client-side encryption is desired,
      * encrypt off-chain and pass the ciphertext here.
@@ -87,9 +112,10 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
      * @param metadata Opaque metadata about the identity
      * @return identityId The ID of the created identity
      */
-    function createIdentity(string memory name, bytes memory metadata) public returns (bytes32) {
-        // Generate a deterministic but unique identity ID
-        bytes32 identityId = keccak256(abi.encodePacked(msg.sender, name, block.timestamp));
+    function createIdentity(string memory name, bytes memory metadata) public whenNotPaused returns (bytes32) {
+        // Generate a deterministic but unique identity ID using OpenZeppelin's Counter
+        _identityCounter.increment();
+        bytes32 identityId = keccak256(abi.encodePacked(msg.sender, name, _identityCounter.current(), block.timestamp));
         
         require(!identities[msg.sender][identityId].exists, "Identity already exists");
         
@@ -120,7 +146,7 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
      * @dev Switch the active identity
      * @param identityId The ID of the identity to make active
      */
-    function switchIdentity(bytes32 identityId) public {
+    function switchIdentity(bytes32 identityId) public whenNotPaused {
         require(identities[msg.sender][identityId].exists, "Identity does not exist");
         
         activeIdentities[msg.sender] = identityId;
@@ -141,7 +167,7 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
         address outputToken,
         uint256 amountIn,
         uint256 minAmountOut
-    ) public nonReentrant returns (uint256) {
+    ) public nonReentrant whenNotPaused returns (uint256) {
         // Get the active persona/identity for this transaction
         bytes32 identityId = activeIdentities[msg.sender];
         require(identityId != bytes32(0), "No active identity");
@@ -161,8 +187,8 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
             // Pull tokens from user (user must approve this contract for amountIn)
             IERC20(inputToken).safeTransferFrom(msg.sender, address(this), amountIn);
 
-            // Approve router exactly for amountIn
-            IERC20(inputToken).forceApprove(swapRouter, amountIn);
+            // Approve router exactly for amountIn using SafeERC20
+            IERC20(inputToken).safeApprove(swapRouter, amountIn);
 
             // Execute Uniswap V3 exactInputSingle
             ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
@@ -272,7 +298,7 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
      * effectively splitting the trade history across multiple personas
      * @param identityId New identity to switch to
      */
-    function midTradeSwitch(bytes32 identityId, bool /* continueSwap */) public {
+    function midTradeSwitch(bytes32 identityId, bool /* continueSwap */) public whenNotPaused {
         require(identities[msg.sender][identityId].exists, "Identity does not exist");
         
         // Switch to the new identity
@@ -281,5 +307,13 @@ contract IdentityShapeshifter is Ownable, ReentrancyGuard {
         emit ActiveIdentityChanged(msg.sender, identityId);
         
         // Additional logic for continued swaps would go here in a full implementation
+    }
+
+    /**
+     * @dev Get the current identity counter value (using OpenZeppelin's Counters)
+     * @return Current counter value
+     */
+    function getIdentityCounter() public view returns (uint256) {
+        return _identityCounter.current();
     }
 }

@@ -43,7 +43,8 @@ export default function Home() {
       setContractAddress(addr);
 
       const onSapphire = [23294, 23295].includes(Number(cid));
-      if (!onSapphire) return;
+      const onLocalhost = Number(cid) === 31337;
+      if (!onSapphire && !onLocalhost) return;
 
       if (addr) {
         try {
